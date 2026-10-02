@@ -54,3 +54,13 @@ mount. Without it, these commands refuse to run against a remote daemon.
 - `truncate` discards pieces completed after the first gap. aria2 still records
   them as done, so resuming the download afterwards leaves holes.
 - Path translation assumes the daemon runs on a POSIX system.
+
+## Development
+
+Tests use only the standard library and a fake aria2, so no daemon is needed:
+
+    python3 -m unittest discover -s tests
+
+## License
+
+MIT. See [LICENSE](LICENSE).
