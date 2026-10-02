@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import os
+import struct
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+def rpc_call(url: str, method: str, params: list, secret: str = "") -> dict:
+    if secret:
+        params.insert(0, f"token:{secret}")
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "aria2ctl",
+        "method": method,
+        "params": params,
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if "error" in data:
+                sys.exit(f"RPC Error [{data['error']['code']}]: {data['error']['message']}")
+            return data.get("result")
+    except urllib.error.URLError as err:
+        sys.exit(f"Connection failed: {err}")
+
+
+def format_bytes(size: int) -> str:
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB"]:
+        if size < 1024.0:
+            return f"{size:6.2f} {unit}"
+        size /= 1024.0
+    return f"{size:6.2f} PiB"
+
+
+def resolve_gid(args, prefix: str) -> str:
+    """Expand a unique GID prefix to the full GID, like git does for commit hashes."""
+    prefix = prefix.lower()
+    if len(prefix) == 16:
+        return prefix
+
+    keys = ["gid"]
+    active = rpc_call(args.rpc_url, "aria2.tellActive", [keys], args.rpc_secret) or []
+    waiting = rpc_call(args.rpc_url, "aria2.tellWaiting", [0, 1000, keys], args.rpc_secret) or []
+    stopped = rpc_call(args.rpc_url, "aria2.tellStopped", [0, 1000, keys], args.rpc_secret) or []
+
+    matches = sorted({d["gid"] for d in active + waiting + stopped if d["gid"].startswith(prefix)})
+    if not matches:
+        sys.exit(f"No download matches GID prefix: {prefix}")
+    if len(matches) > 1:
+        sys.exit(f"GID prefix '{prefix}' is ambiguous. Candidates:\n  " + "\n  ".join(matches))
+    return matches[0]
+
+
+def cmd_status(args):
+    keys = [
+        "gid",
+        "status",
+        "errorCode",
+        "errorMessage",
+        "dir",
+        "totalLength",
+        "completedLength",
+        "uploadSpeed",
+        "downloadSpeed",
+        "bittorrent",
+        "followedBy",
+    ]
+    res = rpc_call(args.rpc_url, "aria2.tellStatus", [args.gid, keys], args.rpc_secret)
+    if not res:
+        sys.exit(f"No status returned for GID: {args.gid}")
+
+    status = res.get("status", "unknown")
+    name = "Unknown"
+    if "bittorrent" in res and "info" in res["bittorrent"]:
+        name = res["bittorrent"]["info"].get("name", "Unknown")
+
+    total = format_bytes(int(res.get("totalLength", 0)))
+    completed = format_bytes(int(res.get("completedLength", 0)))
+    dl_speed = format_bytes(int(res.get("downloadSpeed", 0))) + "/s"
+    ul_speed = format_bytes(int(res.get("uploadSpeed", 0))) + "/s"
+
+    print(f"GID:             {res.get('gid')}")
+    print(f"Name:            {name}")
+    print(f"Status:          {status}")
+    print(f"Save Directory:  {res.get('dir')}")
+    print(f"Progress:        {completed} / {total}")
+    print(f"Speed:           DL: {dl_speed} | UL: {ul_speed}")
+    if res.get("followedBy"):
+        print(f"Followed By:     {', '.join(res['followedBy'])}")
+
+    if status == "error" or res.get("errorCode"):
+        print("\n--- ERROR DETAILS ---")
+        print(f"Error Code:      {res.get('errorCode')}")
+        print(f"Error Message:   {res.get('errorMessage') or 'None provided by daemon'}")
+
+
+def cmd_list(args):
+    keys = ["gid", "status", "bittorrent", "totalLength", "files"]
+    
+    active = rpc_call(args.rpc_url, "aria2.tellActive", [keys], args.rpc_secret) or []
+    waiting = rpc_call(args.rpc_url, "aria2.tellWaiting", [0, 1000, keys], args.rpc_secret) or []
+    stopped = rpc_call(args.rpc_url, "aria2.tellStopped", [0, 1000, keys], args.rpc_secret) or []
+
+    downloads = active + waiting + stopped
+
+    if not args.all:
+        downloads = [d for d in downloads if "bittorrent" in d]
+
+    if not downloads:
+        print("No matching downloads found.")
+        return
+
+    print(f"{'GID':<16} | {'Status':<8} | {'Size':<10} | {'Files':<5} | Name")
+    print("-" * 80)
+    for d in downloads:
+        gid = d.get("gid", "")
+        status = d.get("status", "")
+        size = format_bytes(int(d.get("totalLength", 0)))
+        num_files = len(d.get("files", []))
+        
+        name = "Unknown"
+        if "bittorrent" in d and "info" in d["bittorrent"]:
+            name = d["bittorrent"]["info"].get("name", "Unknown")
+        elif d.get("files"):
+            name = d["files"][0].get("path") or "Unknown"
+
+        print(f"{gid:<16} | {status:<8} | {size} | {num_files:<5} | {name}")
+
+
+def cmd_add(args):
+    src = args.source
+    if os.path.isfile(src):
+        try:
+            with open(src, "rb") as f:
+                torrent_b64 = base64.b64encode(f.read()).decode("utf-8")
+        except OSError as err:
+            sys.exit(f"Could not open torrent file: {err}")
+        opts = {} if args.start else {"pause": "true"}
+        gid = rpc_call(args.rpc_url, "aria2.addTorrent", [torrent_b64, [], opts], args.rpc_secret)
+    elif src.startswith(("magnet:", "http://", "https://", "ftp://", "sftp://")):
+        opts = {}
+        if not args.start:
+            # A paused magnet would never fetch its metadata, so let the metadata
+            # download run and pause the torrent download it creates instead.
+            opts = {"pause-metadata": "true"} if src.startswith("magnet:") else {"pause": "true"}
+        gid = rpc_call(args.rpc_url, "aria2.addUri", [[src], opts], args.rpc_secret)
+    else:
+        sys.exit(f"Not a file or a supported URL: {src}")
+
+    state = "started" if args.start else "paused"
+    print(f"Added ({state}). GID: {gid}")
+    if src.startswith("magnet:"):
+        print("Fetching metadata; the torrent will appear as a new download once it arrives.")
+        print(f"Run 'aria2ctl status {gid[:6]}' and look for 'Followed By' to get its GID.")
+
+
+def cmd_pause(args):
+    method = "aria2.forcePause" if args.force else "aria2.pause"
+    if args.all:
+        rpc_call(args.rpc_url, method + "All", [], args.rpc_secret)
+        print("Paused all downloads.")
+    else:
+        rpc_call(args.rpc_url, method, [args.gid], args.rpc_secret)
+        print(f"Paused {args.gid}.")
+
+
+def cmd_resume(args):
+    if args.all:
+        rpc_call(args.rpc_url, "aria2.unpauseAll", [], args.rpc_secret)
+        print("Resumed all downloads.")
+    else:
+        rpc_call(args.rpc_url, "aria2.unpause", [args.gid], args.rpc_secret)
+        print(f"Resumed {args.gid}.")
+
+
+def path_mapper(args):
+    """Return a function mapping aria2's (server-side) paths to paths on this machine.
+
+    Without a local dir, paths are used as-is, which is only safe when aria2 runs here.
+    With one, the server's download root (aria2's global 'dir' option) is swapped for it.
+    """
+    if not args.local_dir:
+        host = urllib.parse.urlparse(args.rpc_url).hostname
+        if host not in ("localhost", "127.0.0.1", "::1"):
+            sys.exit(
+                f"aria2 runs on {host}, so its file paths do not refer to this machine.\n"
+                "Set --local-dir (or ARIA2_LOCAL_DIR) to where aria2's download folder is mounted here."
+            )
+        return lambda path: os.path.normpath(path)
+
+    local_root = os.path.abspath(os.path.expanduser(args.local_dir))
+    if not os.path.isdir(local_root):
+        sys.exit(f"Local dir {local_root} does not exist. Is the share mounted?")
+    server_root = rpc_call(args.rpc_url, "aria2.getGlobalOption", [], args.rpc_secret)["dir"]
+    server_root = os.path.normpath(server_root)
+
+    def map_path(path):
+        path = os.path.normpath(path)
+        if path != server_root and not path.startswith(server_root.rstrip("/") + "/"):
+            return None
+        return os.path.normpath(os.path.join(local_root, os.path.relpath(path, server_root)))
+
+    return map_path
+
+
+def files_to_delete(res: dict, map_path) -> tuple:
+    """Return (local base dir, existing local files belonging to a download inside that dir)."""
+    base = map_path(res["dir"])
+    if base is None:
+        sys.exit(f"Download dir {res['dir']} is outside aria2's download root; cannot map it here.")
+    base = os.path.realpath(base)
+
+    candidates = set()
+    for f in res.get("files", []):
+        if f.get("path") and not f["path"].startswith("[METADATA]"):
+            candidates.add(f["path"])
+            candidates.add(f["path"] + ".aria2")
+    name = res.get("bittorrent", {}).get("info", {}).get("name")
+    if name:
+        candidates.add(os.path.join(res["dir"], name) + ".aria2")
+
+    result = []
+    for path in candidates:
+        local = map_path(path)
+        if local is None:
+            continue
+        real = os.path.realpath(local)
+        if os.path.isfile(real) and os.path.commonpath([base, real]) == base and real != base:
+            result.append(real)
+    return base, sorted(result)
+
+
+def remove_empty_dirs(paths: list, base: str):
+    dirs = set()
+    for path in paths:
+        d = os.path.dirname(path)
+        while d != base and os.path.commonpath([base, d]) == base:
+            dirs.add(d)
+            d = os.path.dirname(d)
+    for d in sorted(dirs, key=len, reverse=True):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+
+
+def cmd_remove(args):
+    gid = args.gid
+    res = rpc_call(
+        args.rpc_url, "aria2.tellStatus", [gid, ["status", "dir", "files", "bittorrent"]], args.rpc_secret
+    )
+
+    to_delete = []
+    if args.delete_files:
+        base, to_delete = files_to_delete(res, path_mapper(args))
+        if to_delete:
+            print("These files will be deleted from disk:")
+            for path in to_delete:
+                print(f"  {path}")
+            if not args.yes:
+                answer = input(f"Delete {len(to_delete)} file(s)? This cannot be undone. [y/N] ")
+                if answer.strip().lower() not in ("y", "yes"):
+                    print("Aborted. Nothing removed.")
+                    return
+        else:
+            print("No downloaded files found on disk.")
+
+    if res["status"] in ("active", "waiting", "paused"):
+        method = "aria2.forceRemove" if args.force else "aria2.remove"
+        rpc_call(args.rpc_url, method, [gid], args.rpc_secret)
+        # aria2 stops the download asynchronously; wait so its files are closed.
+        for _ in range(100):
+            status = rpc_call(args.rpc_url, "aria2.tellStatus", [gid, ["status"]], args.rpc_secret)
+            if status["status"] == "removed":
+                break
+            time.sleep(0.1)
+        else:
+            sys.exit(f"Timed out waiting for {gid} to stop; try again with --force.")
+
+    rpc_call(args.rpc_url, "aria2.removeDownloadResult", [gid], args.rpc_secret)
+    print(f"Removed {gid} from aria2.")
+
+    if to_delete:
+        failed = 0
+        for path in to_delete:
+            try:
+                os.remove(path)
+            except OSError as err:
+                failed += 1
+                print(f"Could not delete {path}: {err}", file=sys.stderr)
+        remove_empty_dirs(to_delete, base)
+        print(f"Deleted {len(to_delete) - failed} file(s) from disk.")
+
+
+def cmd_clean(args):
+    stopped = rpc_call(args.rpc_url, "aria2.tellStopped", [0, 1000, ["gid"]], args.rpc_secret) or []
+    rpc_call(args.rpc_url, "aria2.purgeDownloadResult", [], args.rpc_secret)
+    print(f"Cleared {len(stopped)} finished, failed, or removed download(s).")
+
+
+def read_control_file(path: str) -> tuple:
+    """Parse an aria2 control file; return (piece length, total length, bitfield)."""
+    with open(path, "rb") as f:
+        # Header: VER (2B), EXT (4B), INFO_HASH_LEN (4B). Version 1 is big-endian,
+        # version 0 is host byte order.
+        ver = struct.unpack(">H", f.read(2))[0]
+        order = ">" if ver == 1 else "<"
+        _ext, info_hash_len = struct.unpack(order + "II", f.read(8))
+        f.seek(info_hash_len, os.SEEK_CUR)
+        # Piece length (4B), Total length (8B), Upload length (8B), Bitfield length (4B)
+        piece_len, total_len, _upload_len, bitfield_len = struct.unpack(order + "IQQI", f.read(24))
+        bitfield = f.read(bitfield_len)
+    return piece_len, total_len, bitfield
+
+
+def piece_done(bitfield: bytes, piece: int) -> bool:
+    return piece // 8 < len(bitfield) and bool((bitfield[piece // 8] >> (7 - piece % 8)) & 1)
+
+
+def cmd_truncate(args):
+    res = rpc_call(
+        args.rpc_url, "aria2.tellStatus", [args.gid, ["status", "dir", "files", "bittorrent"]], args.rpc_secret
+    )
+    if "bittorrent" in res:
+        sys.exit("truncate only supports HTTP/FTP downloads, not torrents.")
+    if args.apply and res["status"] in ("active", "waiting"):
+        sys.exit(f"Download is {res['status']}; pause it first so aria2 is not writing to the file.")
+
+    map_path = path_mapper(args)
+    base = map_path(res["dir"])
+    data_file = map_path(res["files"][0]["path"])
+    if base is None or data_file is None:
+        sys.exit(f"Download dir {res['dir']} is outside aria2's download root; cannot map it here.")
+    base, data_file = os.path.realpath(base), os.path.realpath(data_file)
+    if os.path.commonpath([base, data_file]) != base:
+        sys.exit(f"{data_file} is outside the download dir {base}; refusing.")
+
+    control_file = data_file + ".aria2"
+    if not os.path.isfile(control_file):
+        sys.exit(f"Control file {control_file} not found (download already complete?).")
+    if not os.path.isfile(data_file):
+        sys.exit(f"Data file {data_file} not found.")
+
+    piece_len, total_len, bitfield = read_control_file(control_file)
+    num_pieces = (total_len + piece_len - 1) // piece_len
+    contiguous = 0
+    while contiguous < num_pieces and piece_done(bitfield, contiguous):
+        contiguous += 1
+    contig_bytes = min(contiguous * piece_len, total_len)
+    # Pieces completed after the first gap are thrown away by truncating.
+    lost = sum(piece_done(bitfield, i) for i in range(contiguous + 1, num_pieces))
+    pct = (contig_bytes / total_len * 100) if total_len else 0
+    on_disk = os.path.getsize(data_file)
+
+    print(f"Data file         : {data_file}")
+    print(f"Size on disk      : {on_disk} bytes")
+    print(f"Total file size   : {total_len} bytes")
+    print(f"Piece size        : {piece_len} bytes")
+    print(f"Contiguous prefix : {contig_bytes} bytes ({pct:.2f}%)")
+    if lost and on_disk > contig_bytes:
+        print(f"Warning: {lost} completed piece(s) after the first gap will be discarded.")
+        print("aria2 still records them as done, so resuming this download would leave holes.")
+
+    if on_disk <= contig_bytes:
+        print("Nothing to do: file is not larger than the contiguous prefix.")
+        return
+    if not args.apply:
+        print(f"\nDry run. Run 'aria2ctl truncate {args.gid[:6]} --apply' to truncate.")
+        return
+    os.truncate(data_file, contig_bytes)
+    print(f"Truncated {data_file} to {contig_bytes} bytes.")
+
+
+def print_files(args, gid):
+    files = rpc_call(args.rpc_url, "aria2.getFiles", [gid], args.rpc_secret)
+    if not files:
+        sys.exit(f"No files found or invalid GID: {gid}")
+
+    print(f"{'Index':<7} | {'Size':<10} | {'Selected':<8} | File Path")
+    print("-" * 80)
+    for f in files:
+        idx = f["index"]
+        length = format_bytes(int(f["length"]))
+        selected = "yes" if f.get("selected") == "true" else "no"
+        path = f["path"]
+        print(f"{idx:<7} | {length} | {selected:<8} | {path}")
+
+
+def cmd_files(args):
+    print_files(args, args.gid)
+
+
+def cmd_select(args):
+    gid = args.gid
+
+    print_files(args, gid)
+
+    print("\nSelect files using indices, commas, and hyphens (e.g., '1,3,5-8')")
+    print("Or enter 'all' to select everything, 'q' to abort without changes.")
+    choice = input("Enter selection: ").strip()
+
+    if choice.lower() in ("abort", "q", "exit", ""):
+        print("Aborted. No modifications made to torrent.")
+        return
+
+    if choice.lower() != "all":
+        print(f"Applying select-file={choice}...")
+        rpc_call(
+            args.rpc_url,
+            "aria2.changeOption",
+            [gid, {"select-file": choice}],
+            args.rpc_secret,
+        )
+
+    if not args.no_unpause:
+        print("Resuming download...")
+        rpc_call(args.rpc_url, "aria2.unpause", [gid], args.rpc_secret)
+        print(f"Download resumed for GID {gid}.")
+    else:
+        print(f"Selection applied. Torrent remains paused (GID: {gid}).")
+
+
+def config_path() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "aria2", "aria2ctl.env")
+
+
+def load_config(path: str):
+    """Load KEY=VALUE lines into os.environ. Variables already set in the environment win."""
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return
+    except OSError as err:
+        sys.exit(f"Could not read config file {path}: {err}")
+
+    if os.stat(path).st_mode & 0o077:
+        print(f"Warning: {path} is readable by other users; run: chmod 600 {path}", file=sys.stderr)
+
+    for lineno, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            sys.exit(f"{path}:{lineno}: expected KEY=VALUE")
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+def add_local_dir_arg(parser):
+    parser.add_argument(
+        "--local-dir",
+        default=os.environ.get("ARIA2_LOCAL_DIR", ""),
+        help="Where aria2's download folder is mounted on this machine (default: $ARIA2_LOCAL_DIR)",
+    )
+
+
+def main():
+    load_config(config_path())
+
+    parser = argparse.ArgumentParser(description="Control an aria2 daemon via JSON-RPC.")
+    parser.add_argument(
+        "--rpc-url",
+        default=os.environ.get("ARIA2_RPC_URL", "http://localhost:6800/jsonrpc"),
+        help="Aria2 JSON-RPC endpoint (default: $ARIA2_RPC_URL or http://localhost:6800/jsonrpc)",
+    )
+    parser.add_argument(
+        "--rpc-secret",
+        default=os.environ.get("ARIA2_RPC_SECRET", ""),
+        help="Aria2 RPC secret token (default: $ARIA2_RPC_SECRET)",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Subcommand: list
+    p_list = subparsers.add_parser("list", help="List downloads and their GIDs")
+    p_list.add_argument(
+        "--all", action="store_true", help="List all downloads, including non-torrents"
+    )
+    p_list.set_defaults(func=cmd_list)
+
+    # Subcommand: status
+    p_status = subparsers.add_parser("status", help="Get detailed status and error messages for a GID")
+    p_status.add_argument("gid", help="Download GID (or unique prefix) to inspect")
+    p_status.set_defaults(func=cmd_status)
+
+    # Subcommand: files
+    p_files = subparsers.add_parser("files", help="Show the files in a download")
+    p_files.add_argument("gid", help="Download GID (or unique prefix) to inspect")
+    p_files.set_defaults(func=cmd_files)
+
+    # Subcommand: add (upload kept as an alias)
+    p_add = subparsers.add_parser(
+        "add", aliases=["upload"], help="Add a .torrent file, magnet link, or URL (paused by default)"
+    )
+    p_add.add_argument("source", help="Path to a .torrent file, a magnet link, or a URL")
+    p_add.add_argument("--start", action="store_true", help="Start downloading immediately")
+    p_add.set_defaults(func=cmd_add)
+
+    # Subcommands: pause, resume
+    for name, func, help_text in (
+        ("pause", cmd_pause, "Pause a download"),
+        ("resume", cmd_resume, "Resume a paused download"),
+    ):
+        p = subparsers.add_parser(name, help=help_text)
+        p.add_argument("gid", nargs="?", help="Download GID (or unique prefix)")
+        p.add_argument("--all", action="store_true", help=f"{name.capitalize()} all downloads")
+        if name == "pause":
+            p.add_argument(
+                "--force", action="store_true", help="Pause immediately without contacting trackers"
+            )
+        p.set_defaults(func=func)
+
+    # Subcommand: remove
+    p_remove = subparsers.add_parser("remove", help="Remove a download from aria2")
+    p_remove.add_argument("gid", help="Download GID (or unique prefix)")
+    p_remove.add_argument(
+        "--delete-files", action="store_true", help="Also delete the downloaded files from disk"
+    )
+    add_local_dir_arg(p_remove)
+    p_remove.add_argument("-y", "--yes", action="store_true", help="Do not ask before deleting files")
+    p_remove.add_argument(
+        "--force", action="store_true", help="Remove immediately without contacting trackers"
+    )
+    p_remove.set_defaults(func=cmd_remove)
+
+    # Subcommand: truncate
+    p_truncate = subparsers.add_parser(
+        "truncate", help="Truncate a partial HTTP/FTP download to its contiguous downloaded prefix"
+    )
+    p_truncate.add_argument("gid", help="Download GID (or unique prefix)")
+    p_truncate.add_argument("--apply", action="store_true", help="Truncate (default is a dry run)")
+    add_local_dir_arg(p_truncate)
+    p_truncate.set_defaults(func=cmd_truncate)
+
+    # Subcommand: clean
+    p_clean = subparsers.add_parser("clean", help="Clear finished, failed, and removed downloads")
+    p_clean.set_defaults(func=cmd_clean)
+
+    # Subcommand: select
+    p_select = subparsers.add_parser("select", help="Inspect and select files on an existing GID")
+    p_select.add_argument("gid", help="Download GID (or unique prefix) sitting in the daemon")
+    p_select.add_argument(
+        "--no-unpause", action="store_true", help="Apply file selection without resuming download"
+    )
+    p_select.set_defaults(func=cmd_select)
+
+    args = parser.parse_args()
+    if args.command in ("pause", "resume") and bool(args.gid) == args.all:
+        parser.error(f"{args.command}: give either a GID or --all")
+    if getattr(args, "gid", None):
+        args.gid = resolve_gid(args, args.gid)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
